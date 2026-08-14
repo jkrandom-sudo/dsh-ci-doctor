@@ -125,29 +125,12 @@ export function createWatch(spec: WatchSpec, deps: WatchDeps): WatchHandle {
   void (async () => {
     let failures = 0
     // Runs already failed before the watch started are the baseline, never
-    // detections. Poll once up front to learn the newest known run id.
-    let baselineId = 0
-    try {
-      const existing = await deps.gh.listFailedRuns({
-        repo: spec.repo,
-        ...(spec.branch !== undefined ? { branch: spec.branch } : {}),
-        ...(spec.workflow !== undefined ? { workflow: spec.workflow } : {}),
-        limit: 10,
-      })
-      baselineId = Math.max(0, ...existing.map(run => run.id))
-      push(`ci_watch: baseline set — ignoring ${existing.length} historical failed run(s)`)
-    } catch (error) {
-      if (error instanceof GhError && error.kind === 'auth') {
-        finish(
-          { status: 'failed', detail: 'gh authentication failed' },
-          `ci_watch: ${error.message}`,
-        )
-        return
-      }
-      push(
-        `ci_watch: baseline poll failed (${error instanceof Error ? error.message : String(error)}); will retry on the poll loop`,
-      )
-    }
+    // detections. The baseline is only established by a SUCCESSFUL poll — a
+    // failed baseline poll must not turn every historical red run into a
+    // fresh "detection" on the next successful one, so detection stays
+    // suppressed while baselineId is undefined.
+    let baselineId: number | undefined
+    let firstPoll = true
 
     while (cancelReason === undefined) {
       if (deps.now() >= deadline) {
@@ -157,9 +140,18 @@ export function createWatch(spec: WatchSpec, deps: WatchDeps): WatchHandle {
         )
         return
       }
-      const backoff = Math.min(2 ** failures, MAX_BACKOFF_FACTOR)
-      await cancellableSleep(spec.intervalSeconds * 1000 * backoff)
-      if (cancelReason !== undefined) break
+      if (firstPoll) {
+        // Establish (or retry) the baseline immediately, no initial wait.
+        firstPoll = false
+      } else {
+        const backoff = Math.min(2 ** failures, MAX_BACKOFF_FACTOR)
+        // Never sleep past the deadline: a long (or backed-off) interval must
+        // not let the watch overshoot its lifetime and detect after expiry.
+        const remaining = deadline - deps.now()
+        await cancellableSleep(Math.min(spec.intervalSeconds * 1000 * backoff, remaining))
+        if (cancelReason !== undefined) break
+        if (deps.now() >= deadline) continue // loop top settles the expiry
+      }
       try {
         const runs = await deps.gh.listFailedRuns({
           repo: spec.repo,
@@ -167,8 +159,17 @@ export function createWatch(spec: WatchSpec, deps: WatchDeps): WatchHandle {
           ...(spec.workflow !== undefined ? { workflow: spec.workflow } : {}),
           limit: 10,
         })
+        // A cancel delivered while the poll was in flight wins over anything
+        // the poll returned — never settle a detection for a killed watch.
+        if (cancelReason !== undefined) break
         failures = 0
-        const fresh = runs.filter(run => run.id > baselineId)
+        if (baselineId === undefined) {
+          baselineId = Math.max(0, ...runs.map(run => run.id))
+          push(`ci_watch: baseline set — ignoring ${runs.length} historical failed run(s)`)
+          continue
+        }
+        const baseline = baselineId
+        const fresh = runs.filter(run => run.id > baseline)
         if (fresh.length > 0) {
           const latest = fresh[0]
           if (latest === undefined) continue

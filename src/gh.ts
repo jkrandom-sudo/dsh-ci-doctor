@@ -179,13 +179,17 @@ function shellQuote(value: string): string {
  * @returns The doctor's GitHub client.
  */
 export function createGhClient(run: CommandRunner, ghBin = 'gh'): GhClient {
+  // ghBin comes from configuration, not the model — but it crosses into a
+  // shell command line, so quote it like everything else (a path with spaces
+  // would otherwise break every call, and a hostile value would execute).
+  const bin = shellQuote(ghBin)
   /**
    * Run `gh api <endpoint>` and parse stdout as JSON. JSON endpoints always
    * carry a --jq projection: the full API payloads dwarf the host shell's
    * capture cap (64 KiB by default), and a truncated tail is unparseable.
    */
   async function apiJson<T>(endpoint: string, jq: string): Promise<T> {
-    const result = await run(`${ghBin} api ${shellQuote(endpoint)} --jq ${shellQuote(jq)}`)
+    const result = await run(`${bin} api ${shellQuote(endpoint)} --jq ${shellQuote(jq)}`)
     return parseApiResult<T>(endpoint, result)
   }
 
@@ -212,7 +216,7 @@ export function createGhClient(run: CommandRunner, ghBin = 'gh'): GhClient {
   return {
     async currentRepo(workdir) {
       const cd = workdir === undefined ? '' : `cd ${shellQuote(workdir)} && `
-      const result = await run(`${cd}${ghBin} repo view --json nameWithOwner --jq .nameWithOwner`)
+      const result = await run(`${cd}${bin} repo view --json nameWithOwner --jq .nameWithOwner`)
       if (result.exitCode !== 0 || result.stdout.trim() === '') {
         throw new GhError(
           'not-found',
@@ -259,7 +263,7 @@ export function createGhClient(run: CommandRunner, ghBin = 'gh'): GhClient {
       // host shell's 64 KiB default so trimLog — not the executor's tail
       // truncation — decides what the diagnosis sees.
       const result = await run(
-        `${ghBin} api ${shellQuote(`repos/${repo}/actions/jobs/${jobId}/logs`)}`,
+        `${bin} api ${shellQuote(`repos/${repo}/actions/jobs/${jobId}/logs`)}`,
         { stdoutMaxBytes: 4_000_000 },
       )
       if (result.exitCode !== 0) {

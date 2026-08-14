@@ -63,16 +63,27 @@ export const Config: z<Config> = z.object({
 })
 
 /**
+ * Fall back when a direct-caller config value is unusable. The Loader schema
+ * validates ranges, but schemastery's number check passes NaN/Infinity
+ * through, and direct callers bypass the schema entirely — a NaN interval
+ * would collapse the watch loop into a hot spin.
+ */
+function numberOr(value: number | undefined, fallback: number, min: number): number {
+  if (value === undefined || !Number.isFinite(value) || value < min) return fallback
+  return value
+}
+
+/**
  * Resolve the same defaults for direct callers that bypass Cordis Loader.
  * @param config - Partial serialized configuration.
  * @returns Configuration with all defaults applied.
  */
 export function resolveConfig(config: Config = {}): ResolvedConfig {
   return {
-    pollIntervalSeconds: config.pollIntervalSeconds ?? 30,
-    watchTimeoutMinutes: config.watchTimeoutMinutes ?? 60,
-    maxLogLines: config.maxLogLines ?? 200,
-    ghBin: config.ghBin ?? 'gh',
+    pollIntervalSeconds: numberOr(config.pollIntervalSeconds, 30, 5),
+    watchTimeoutMinutes: numberOr(config.watchTimeoutMinutes, 60, 1),
+    maxLogLines: numberOr(config.maxLogLines, 200, 20),
+    ghBin: config.ghBin !== undefined && config.ghBin.trim() !== '' ? config.ghBin : 'gh',
     ledgerEnabled: config.ledgerEnabled ?? true,
   }
 }

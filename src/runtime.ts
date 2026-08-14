@@ -65,8 +65,13 @@ interface ToolExec {
 export interface DoctorDeps {
   /** GitHub client factory; throws when the host shell seam is unavailable. */
   gh(): GhClient
-  /** Host job registry, when the profile provides one. */
-  jobs?: JobRegistryLike | undefined
+  /**
+   * Resolve the host job registry. Lazy because the plugin mounts as soon as
+   * `tools` is up, which can precede the jobs provider in a real composition
+   * — an eager lookup would freeze a transient miss into a permanently
+   * unavailable ci_watch.
+   */
+  getJobs(): JobRegistryLike | undefined
   /**
    * Resolve the failure-signature ledger. Lazy because the plugin mounts as
    * soon as `tools` is up, which can precede the storage domain in a real
@@ -103,6 +108,8 @@ export interface JobDiagnosis {
   suspectFiles: string[]
   /** Trimmed log excerpt (error windows only). */
   logExcerpt: string
+  /** Why the log is missing (expired, retention-limited), when the fetch failed. */
+  logError?: string
 }
 
 /** Canonical value returned by the ci_diagnose tool. */
@@ -235,6 +242,14 @@ async function resolveRepo(gh: GhClient, repo: string | undefined): Promise<stri
 const MAX_JOBS_DIAGNOSED = 3
 
 /**
+ * Hard ceiling on the per-job excerpt budget. fetchJobLog deliberately raises
+ * the shell capture budget to 4 MB; without a cap here, a huge maxLines would
+ * pour the whole raw log into the model's context — the exact outcome the
+ * trim design exists to prevent.
+ */
+const MAX_LOG_LINES = 2_000
+
+/**
  * Run one diagnosis against a failed run: fetch failed-job logs, extract
  * signatures, consult and update the ledger, and assemble the report value.
  * @param deps - Plugin dependencies.
@@ -265,7 +280,7 @@ export async function diagnose(deps: DoctorDeps, args: CiDiagnoseArgs): Promise<
     }
   }
 
-  const maxLines = args.maxLines ?? deps.config.maxLogLines
+  const maxLines = Math.min(args.maxLines ?? deps.config.maxLogLines, MAX_LOG_LINES)
   const allJobs = await gh.listJobs(repo, run.id)
   let failedJobs = allJobs.filter(job => job.conclusion === 'failure')
   if (args.job !== undefined) {
@@ -276,7 +291,24 @@ export async function diagnose(deps: DoctorDeps, args: CiDiagnoseArgs): Promise<
   const ledger = await deps.getLedger()
 
   for (const job of failedJobs.slice(0, MAX_JOBS_DIAGNOSED)) {
-    const log = await gh.fetchJobLog(repo, job.id)
+    let log: string
+    try {
+      log = await gh.fetchJobLog(repo, job.id)
+    } catch (error) {
+      // One unreadable log (expired past retention, transient API failure)
+      // must not abort the whole diagnosis — the other failed jobs still
+      // carry their signatures.
+      diagnosed.push({
+        id: job.id,
+        name: job.name,
+        failedSteps: job.failedSteps.map(step => step.name),
+        signatures: [],
+        suspectFiles: [],
+        logExcerpt: '',
+        logError: error instanceof Error ? error.message : String(error),
+      })
+      continue
+    }
     const signatures: DiagnosedSignature[] = []
     for (const signature of extractSignatures(log)) {
       const record = await ledger.record(signature, {
@@ -314,6 +346,16 @@ export async function diagnose(deps: DoctorDeps, args: CiDiagnoseArgs): Promise<
   return value
 }
 
+/**
+ * Make attacker-influenced log text safe to wrap in a four-backtick fence:
+ * any run of 4+ backticks in the content would close the fence early and let
+ * the remainder render as live markdown (a prompt-injection channel), so such
+ * runs are collapsed. Three backticks stay verbatim — the fence is longer.
+ */
+function fenceSafe(text: string): string {
+  return text.replace(/`{4,}/g, '```')
+}
+
 function renderDiagnosis(value: CiDiagnoseValue, run: GhRun, totalFailedJobs: number): string {
   const lines: string[] = [
     `## CI diagnosis: ${value.repo} run #${value.runId}`,
@@ -346,15 +388,20 @@ function renderDiagnosis(value: CiDiagnoseValue, run: GhRun, totalFailedJobs: nu
       lines.push(`**Suspect files:** ${job.suspectFiles.map(file => `\`${file}\``).join(', ')}`)
       lines.push(``)
     }
-    lines.push(
-      `<details><summary>Log excerpt</summary>`,
-      ``,
-      '```',
-      job.logExcerpt,
-      '```',
-      `</details>`,
-      ``,
-    )
+    if (job.logError !== undefined) {
+      lines.push(`**Log unavailable:** ${job.logError}`)
+      lines.push(``)
+    } else {
+      lines.push(
+        `<details><summary>Log excerpt</summary>`,
+        ``,
+        '````',
+        fenceSafe(job.logExcerpt),
+        '````',
+        `</details>`,
+        ``,
+      )
+    }
   }
   if (totalFailedJobs > value.jobs.length) {
     lines.push(
@@ -430,7 +477,7 @@ export function createCiWatchTool(deps: DoctorDeps): Parameters<ToolRegistry['re
       render: (_args, value) => [{ type: 'text', text: (value as CiWatchValue).markdown }],
     },
     execute: async (args, exec) => {
-      const jobs = deps.jobs
+      const jobs = deps.getJobs()
       if (jobs === undefined) {
         throw new Error(
           'ci_watch requires the host jobs service (ctx.jobs); use ci_diagnose for a one-shot check',
@@ -508,7 +555,7 @@ export function createCiDiagnoseTool(deps: DoctorDeps): Parameters<ToolRegistry[
         },
         maxLines: {
           type: 'number',
-          description: `Log lines kept per job (default ${deps.config.maxLogLines}).`,
+          description: `Log lines kept per job (default ${deps.config.maxLogLines}, max ${MAX_LOG_LINES}).`,
         },
         format: {
           type: 'string',
@@ -618,10 +665,12 @@ export async function apply(ctx: Context, config: Config): Promise<void> {
     return ledgerPromise
   }
 
-  const jobs = ctx.get('jobs') as JobRegistryLike | undefined
+  // Same mount-order reasoning as the shell: the jobs provider can mount
+  // after `tools`, so resolve it at call time, never at apply time.
+  const getJobs = (): JobRegistryLike | undefined => ctx.get('jobs') as JobRegistryLike | undefined
   const deps: DoctorDeps = {
     gh,
-    ...(jobs !== undefined ? { jobs } : {}),
+    getJobs,
     getLedger,
     config: resolved,
     sleep: ms => new Promise(resolve => setTimeout(resolve, ms)),

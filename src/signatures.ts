@@ -48,7 +48,7 @@ const TIMESTAMP_RES = [
   /\b\d{2}:\d{2}:\d{2}(\.\d+)?\b/g,
 ]
 
-const HEX_RE = /\b[0-9a-f]{7,40}\b/gi
+const HEX_RE = /\b[0-9a-f]{7,}\b/gi
 const NUMBER_RE = /\b\d+\b/g
 const WHITESPACE_RE = /\s+/g
 
@@ -174,7 +174,11 @@ export function extractSignatures(log: string, max = 8): ErrorSignature[] {
   const seen = new Set<string>()
   const out: ErrorSignature[] = []
   for (const rawLine of log.split('\n')) {
-    const line = stripAnsi(rawLine).trim()
+    let line = stripAnsi(rawLine).trim()
+    // GitHub Actions prefixes its canonical failure line with ##[error];
+    // unwrap it before the noise filter (which drops ##[ group/notice
+    // markers) so the headline failure is never discarded as noise.
+    if (line.startsWith('##[error]')) line = line.slice('##[error]'.length).trim()
     if (line === '' || NOISE_LINE_RE.test(line)) continue
     if (!ERROR_LINE_RE.test(line)) continue
     const text = normalizeLine(line).slice(0, MAX_SIGNATURE_LENGTH)

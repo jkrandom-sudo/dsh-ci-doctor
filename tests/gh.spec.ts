@@ -1,20 +1,27 @@
 import { describe, expect, it } from 'vitest'
 
-import { createGhClient, GhError, type CommandRunner } from '../src/gh.ts'
+import { createGhClient, createShellRunner, GhError, type CommandRunner } from '../src/gh.ts'
 
 /** Build a runner that maps command substrings to queued results. */
 function fakeRunner(
-  routes: Record<string, { exitCode?: number; stdout?: string; stderr?: string }>,
+  routes: Record<
+    string,
+    { exitCode?: number | null; stdout?: string; stderr?: string; timedOut?: boolean }
+  >,
 ) {
-  const calls: string[] = []
-  const run: CommandRunner = async command => {
-    calls.push(command)
+  const calls: { command: string; stdoutMaxBytes?: number }[] = []
+  const run: CommandRunner = async (command, options) => {
+    calls.push({
+      command,
+      ...(options?.stdoutMaxBytes !== undefined ? { stdoutMaxBytes: options.stdoutMaxBytes } : {}),
+    })
     for (const [needle, result] of Object.entries(routes)) {
       if (command.includes(needle)) {
         return {
-          exitCode: result.exitCode ?? 0,
+          exitCode: result.exitCode === undefined ? 0 : result.exitCode,
           stdout: result.stdout ?? '',
           stderr: result.stderr ?? '',
+          ...(result.timedOut !== undefined ? { timedOut: result.timedOut } : {}),
         }
       }
     }
@@ -49,7 +56,7 @@ describe('createGhClient', () => {
       conclusion: 'failure',
       url: 'https://github.com/octo/demo/actions/runs/9001',
     })
-    expect(calls[0]).toContain('repos/octo/demo/actions/runs?status=failure&per_page=10')
+    expect(calls[0]?.command).toContain('repos/octo/demo/actions/runs?status=failure&per_page=10')
   })
 
   it('applies branch and workflow filters to the endpoint', async () => {
@@ -63,9 +70,9 @@ describe('createGhClient', () => {
       workflow: 'ci.yml',
       limit: 5,
     })
-    expect(calls[0]).toContain('actions/workflows/ci.yml/runs')
-    expect(calls[0]).toContain('per_page=5')
-    expect(calls[0]).toContain('branch=release%2F1.0')
+    expect(calls[0]?.command).toContain('actions/workflows/ci.yml/runs')
+    expect(calls[0]?.command).toContain('per_page=5')
+    expect(calls[0]?.command).toContain('branch=release%2F1.0')
   })
 
   it('fetches a single run', async () => {
@@ -108,7 +115,7 @@ describe('createGhClient', () => {
     const gh = createGhClient(run)
     const log = await gh.fetchJobLog('octo/demo', 555)
     expect(log).toContain('error: boom')
-    expect(calls[0]).toContain('repos/octo/demo/actions/jobs/555/logs')
+    expect(calls[0]?.command).toContain('repos/octo/demo/actions/jobs/555/logs')
   })
 
   it('resolves the current repo from the workdir', async () => {
@@ -116,7 +123,7 @@ describe('createGhClient', () => {
     const gh = createGhClient(run)
     await expect(gh.currentRepo()).resolves.toBe('octo/demo')
     await expect(gh.currentRepo('/tmp/work')).resolves.toBe('octo/demo')
-    expect(calls[1]).toContain(`cd '/tmp/work'`)
+    expect(calls[1]?.command).toContain(`cd '/tmp/work'`)
   })
 
   it('classifies rate-limit failures', async () => {
@@ -160,7 +167,86 @@ describe('createGhClient', () => {
     await gh.listFailedRuns({ repo: "octo/demo'$(rm -rf ~)'" })
     // The embedded single quote is escaped as '\'' so the whole endpoint stays
     // inside one single-quoted shell word — nothing is evaluated.
-    expect(calls[0]).toContain(`'\\''`)
-    expect(calls[0]).toMatch(/gh api 'repos\//)
+    expect(calls[0]?.command).toContain(`'\\''`)
+    expect(calls[0]?.command).toMatch(/'gh' api 'repos\//)
+  })
+
+  it('raises the stdout capture budget for raw job logs', async () => {
+    // The host shell caps captured stdout at 64 KiB by default; megabyte CI
+    // logs need the budget raised — this pins the 4 MB request.
+    const { run, calls } = fakeRunner({ 'jobs/555/logs': { stdout: 'log' } })
+    const gh = createGhClient(run)
+    await gh.fetchJobLog('octo/demo', 555)
+    expect(calls[0]?.stdoutMaxBytes).toBe(4_000_000)
+  })
+
+  it('classifies runner timeouts', async () => {
+    const { run } = fakeRunner({
+      'actions/runs': { exitCode: null, timedOut: true, stderr: '' },
+    })
+    const gh = createGhClient(run)
+    const error = await gh.listFailedRuns({ repo: 'octo/demo' }).catch(e => e)
+    expect((error as GhError).kind).toBe('timeout')
+  })
+
+  it('fails currentRepo when the workdir is not a GitHub checkout', async () => {
+    const { run } = fakeRunner({
+      'repo view': { exitCode: 1, stderr: 'not a git repository' },
+    })
+    const gh = createGhClient(run)
+    const error = await gh.currentRepo().catch(e => e)
+    expect((error as GhError).kind).toBe('not-found')
+    expect((error as GhError).message).toContain('could not resolve')
+  })
+
+  it('shell-quotes a custom ghBin (paths with spaces stay one word)', async () => {
+    const { run, calls } = fakeRunner({ 'actions/runs': { stdout: '{"workflow_runs":[]}' } })
+    const gh = createGhClient(run, '/opt/my tools/gh')
+    await gh.listFailedRuns({ repo: 'octo/demo' })
+    expect(calls[0]?.command.startsWith(`'/opt/my tools/gh' api`)).toBe(true)
+  })
+})
+
+describe('createShellRunner', () => {
+  /** A host-shaped fake: resolve takes a request, run returns nested blocks. */
+  function fakeShell(result: {
+    exitCode: number | null
+    stdout: string
+    stderr: string
+    timedOut: boolean
+  }) {
+    const requests: { command: string; timeoutMs?: number; stdoutMaxBytes?: number }[] = []
+    return {
+      requests,
+      shell: {
+        resolve(request: { command: string; timeoutMs?: number; stdoutMaxBytes?: number }) {
+          requests.push(request)
+          return request
+        },
+        run: async (_spec: unknown) => ({
+          exitCode: result.exitCode,
+          stdout: { text: result.stdout },
+          stderr: { text: result.stderr },
+          timedOut: result.timedOut,
+        }),
+      },
+    }
+  }
+
+  it('unwraps the host result blocks into the flat CommandResult', async () => {
+    const { shell } = fakeShell({ exitCode: 0, stdout: 'out', stderr: 'err', timedOut: false })
+    const run = createShellRunner(shell)
+    const result = await run('echo hi')
+    expect(result).toEqual({ exitCode: 0, stdout: 'out', stderr: 'err', timedOut: false })
+  })
+
+  it('forwards stdoutMaxBytes only when given', async () => {
+    const { shell, requests } = fakeShell({ exitCode: 0, stdout: '', stderr: '', timedOut: false })
+    const run = createShellRunner(shell)
+    await run('small')
+    await run('big', { stdoutMaxBytes: 4_000_000 })
+    expect(requests[0]?.stdoutMaxBytes).toBeUndefined()
+    expect(requests[1]?.stdoutMaxBytes).toBe(4_000_000)
+    expect(requests[0]?.timeoutMs).toBe(60_000)
   })
 })
