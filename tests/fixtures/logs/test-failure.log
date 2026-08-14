@@ -1,0 +1,18 @@
+2026-08-14T07:12:01.1234567Z ##[group]Run pnpm install
+2026-08-14T07:12:02.0000000Z added 412 packages in 9s
+2026-08-14T07:12:03.0000000Z ##[endgroup]
+2026-08-14T07:12:04.0000000Z ##[group]Run pnpm test
+2026-08-14T07:12:05.1000000Z > dsh-ci-doctor@0.1.0 test /home/runner/work/dsh-ci-doctor/dsh-ci-doctor
+2026-08-14T07:12:05.2000000Z > vitest run
+2026-08-14T07:12:06.3000000Z  RUN  v4.1.8
+2026-08-14T07:12:07.0000000Z  ✓ tests/logs.spec.ts (4 tests) 12ms
+2026-08-14T07:12:08.1000000Z  ❯ tests/watcher.spec.ts (6 tests | 1 failed) 44ms
+2026-08-14T07:12:08.2000000Z    ✓ detects a new failure
+2026-08-14T07:12:08.3000000Z    × expires after the timeout
+2026-08-14T07:12:08.4000000Z  FAIL  tests/watcher.spec.ts > expires after the timeout
+2026-08-14T07:12:08.5000000Z AssertionError: expected 'running' to be 'completed'
+2026-08-14T07:12:08.6000000Z  ❯ tests/watcher.spec.ts:71:23
+2026-08-14T07:12:08.7000000Z
+2026-08-14T07:12:09.0000000Z  Tests  1 failed | 5 passed (6)
+2026-08-14T07:12:09.1000000Z  ELIFECYCLE  Test failed. See above for more details.
+2026-08-14T07:12:09.2000000Z ##[error]Process completed with exit code 1.

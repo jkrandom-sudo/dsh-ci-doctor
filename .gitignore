@@ -4,6 +4,7 @@ dist/
 *.tsbuildinfo
 *.tgz
 *.log
+!tests/fixtures/**/*.log
 .DS_Store
 .npmrc
 CLAUDE.md

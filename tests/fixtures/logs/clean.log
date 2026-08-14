@@ -1,0 +1,5 @@
+2026-08-14T10:00:01.0000000Z ##[group]Run pnpm test
+2026-08-14T10:00:02.0000000Z  ✓ tests/a.spec.ts (2 tests) 8ms
+2026-08-14T10:00:03.0000000Z  ✓ tests/b.spec.ts (3 tests) 11ms
+2026-08-14T10:00:04.0000000Z  Tests  5 passed (5)
+2026-08-14T10:00:05.0000000Z ##[endgroup]

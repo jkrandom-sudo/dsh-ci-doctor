@@ -1,0 +1,5 @@
+2026-08-14T08:00:01.0000000Z ##[group]Run pnpm build
+2026-08-14T08:00:02.0000000Z > tsc -b && tsdown
+2026-08-14T08:00:03.0000000Z src/gh.ts(41,17): error TS2352: Conversion of type 'A' to type 'B' may be a mistake
+2026-08-14T08:00:03.1000000Z src/runtime.ts(9,65): error TS6133: 'GhJob' is declared but its value is never read.
+2026-08-14T08:00:04.0000000Z ##[error]Process completed with exit code 2.
