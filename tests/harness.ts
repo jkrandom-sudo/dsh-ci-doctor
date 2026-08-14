@@ -25,6 +25,43 @@ export function createFakeTools() {
   }
 }
 
+/** One canned shell response (flat shape — the fake wraps it host-style). */
+export interface FakeShellResult {
+  exitCode: number | null
+  stdout: string
+  stderr: string
+  timedOut?: boolean
+}
+
+/**
+ * A fake of the host shell seam that mirrors the REAL host contract:
+ * resolve() takes `{command, timeoutMs?, stdoutMaxBytes?}` and run() returns
+ * nested `{stdout: {text}, stderr: {text}}` blocks. Routing through this fake
+ * exercises createShellRunner's unwrapping — the exact boundary where a
+ * host-shape drift once shipped silently in a sister plugin.
+ */
+export function createFakeShell(handler: (command: string) => FakeShellResult) {
+  const requests: { command: string; timeoutMs?: number; stdoutMaxBytes?: number }[] = []
+  return {
+    requests,
+    service: {
+      resolve(request: { command: string; timeoutMs?: number; stdoutMaxBytes?: number }) {
+        requests.push(request)
+        return request
+      },
+      run: async (spec: { command: string }) => {
+        const result = handler(spec.command)
+        return {
+          exitCode: result.exitCode,
+          stdout: { text: result.stdout },
+          stderr: { text: result.stderr },
+          timedOut: result.timedOut ?? false,
+        }
+      },
+    },
+  }
+}
+
 /** A queued-response fake of the host jobs registry. */
 export function createFakeJobs() {
   const started: { kind: string; label: string; owner?: unknown; hooks: unknown }[] = []
@@ -118,16 +155,16 @@ interface HarnessOptions {
   config?: plugin.Config
   gh?: GhClient
   withJobs?: boolean
-  withShell?: boolean
+  shell?: (command: string) => FakeShellResult
   storageDomain?: unknown
 }
 
 /**
- * Mount the production plugin against fake host services. The fake shell is
- * bypassed: `gh` is injected by wrapping the plugin's `apply` through a test
- * double of the deps — instead we provide a shell that throws, and override
- * the tool deps via the returned registry entries. For tool-level tests use
- * {@link createDepsHarness} which builds tool definitions directly.
+ * Mount the production plugin against fake host services. Provide `shell` to
+ * route gh commands through the real apply() wiring (createShellRunner +
+ * createGhClient); without it the shell seam is absent and the gh() closure
+ * throws. For tool-level tests with a mocked GitHub client use
+ * {@link createDepsHarness} instead.
  */
 export async function createPluginHarness(options: HarnessOptions = {}) {
   const ctx = new Context()
@@ -136,14 +173,8 @@ export async function createPluginHarness(options: HarnessOptions = {}) {
   ctx.provide('tools', tools.service)
   if (options.withJobs !== false) ctx.provide('jobs', jobs.service)
   if (options.storageDomain !== undefined) ctx.provide('storageDomain', options.storageDomain)
-  if (options.withShell === true) {
-    ctx.provide('shell', {
-      resolve: (request: unknown) => request,
-      run: async () => {
-        throw new Error('fake shell: no command expected')
-      },
-    })
-  }
+  const shell = options.shell === undefined ? undefined : createFakeShell(options.shell)
+  if (shell !== undefined) ctx.provide('shell', shell.service)
   const info = vi.spyOn(ctx.logger, 'info').mockImplementation(() => undefined)
   const fiber = await ctx.plugin(plugin, options.config ?? {})
 
@@ -152,6 +183,7 @@ export async function createPluginHarness(options: HarnessOptions = {}) {
     fiber,
     tools,
     jobs,
+    shell,
     info,
     async dispose(): Promise<void> {
       try {
@@ -165,7 +197,9 @@ export async function createPluginHarness(options: HarnessOptions = {}) {
 
 /** Build tool definitions directly against fully fake dependencies. */
 export function createDepsHarness(
-  overrides: Omit<Partial<DoctorDeps>, 'jobs'> & { jobs?: DoctorDeps['jobs'] | undefined } = {},
+  overrides: Omit<Partial<DoctorDeps>, 'getJobs'> & {
+    jobs?: ReturnType<typeof createFakeJobs>['service'] | undefined
+  } = {},
 ) {
   const gh = createFakeGh()
   const jobs = createFakeJobs()
@@ -173,7 +207,7 @@ export function createDepsHarness(
   const ledger = createMemoryLedger()
   const deps: DoctorDeps = {
     gh: () => gh,
-    jobs: jobs.service as unknown as NonNullable<DoctorDeps['jobs']>,
+    getJobs: 'jobs' in overrides ? () => overrides.jobs : () => jobs.service,
     getLedger: async () => ledger,
     config: resolveConfig(),
     sleep: clock.sleep,

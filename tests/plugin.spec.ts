@@ -53,6 +53,18 @@ describe('dsh-ci-doctor plugin shape', () => {
       watchTimeoutMinutes: 60,
     })
   })
+
+  it('falls back on non-finite or out-of-range direct config values', () => {
+    // The Loader schema validates ranges but schemastery passes NaN/Infinity
+    // through; a NaN poll interval would collapse the watch loop into a hot
+    // spin, so the direct path defends itself.
+    expect(resolveConfig({ pollIntervalSeconds: NaN }).pollIntervalSeconds).toBe(30)
+    expect(resolveConfig({ pollIntervalSeconds: Infinity }).pollIntervalSeconds).toBe(30)
+    expect(resolveConfig({ pollIntervalSeconds: 0 }).pollIntervalSeconds).toBe(30)
+    expect(resolveConfig({ watchTimeoutMinutes: Infinity }).watchTimeoutMinutes).toBe(60)
+    expect(resolveConfig({ maxLogLines: NaN }).maxLogLines).toBe(200)
+    expect(resolveConfig({ ghBin: '  ' }).ghBin).toBe('gh')
+  })
 })
 
 describe('plugin activation', () => {
@@ -87,9 +99,85 @@ describe('plugin activation', () => {
     await harness.dispose()
     expect(harness.tools.unregistered).toHaveLength(2)
   })
+
+  it('executes ci_diagnose through the real apply() wiring and shell adapter', async () => {
+    // End-to-end through the mounted plugin: the registered tool → the lazy
+    // gh() closure → createShellRunner → the host-shaped shell contract
+    // (nested {stdout: {text}} blocks, resolve requests with capture budgets).
+    const RUN = {
+      id: 9001,
+      name: 'CI',
+      head_branch: 'main',
+      head_sha: '0123456789abcdef',
+      conclusion: 'failure',
+      status: 'completed',
+      html_url: 'https://github.com/octo/demo/actions/runs/9001',
+      created_at: '2026-08-14T07:00:00Z',
+    }
+    const harness = await createPluginHarness({
+      shell: command => {
+        if (command.includes('repo view')) return { exitCode: 0, stdout: 'octo/demo\n', stderr: '' }
+        if (command.includes('jobs/555/logs'))
+          return {
+            exitCode: 0,
+            stdout: 'setup ok\nerror: boom in tests/watcher.spec.ts\n',
+            stderr: '',
+          }
+        if (command.includes('/jobs?per_page=100'))
+          return {
+            exitCode: 0,
+            stdout: JSON.stringify({
+              jobs: [
+                {
+                  id: 555,
+                  name: 'test',
+                  conclusion: 'failure',
+                  steps: [{ name: 'pnpm test', conclusion: 'failure' }],
+                },
+              ],
+            }),
+            stderr: '',
+          }
+        if (command.includes('actions/runs?status=failure'))
+          return { exitCode: 0, stdout: JSON.stringify({ workflow_runs: [RUN] }), stderr: '' }
+        return { exitCode: 1, stdout: '', stderr: `no route for: ${command}` }
+      },
+    })
+    try {
+      const diagnose = harness.tools.registered.find(
+        def => (def as ToolDef).name === 'ci_diagnose',
+      ) as ToolDef
+      const value = (await diagnose.execute({}, { name: 'ci_diagnose', arguments: {} })) as {
+        repo: string
+        runId: number
+        jobs: { name: string; signatures: { id: string }[] }[]
+        repositoryWrites: boolean
+      }
+      expect(value.repo).toBe('octo/demo')
+      expect(value.runId).toBe(9001)
+      expect(value.jobs[0]?.name).toBe('test')
+      expect(value.jobs[0]?.signatures.length).toBeGreaterThan(0)
+      expect(value.repositoryWrites).toBe(false)
+      // The shell saw host-shape resolve requests, and the raw-log fetch
+      // carried the raised 4 MB capture budget.
+      const logRequest = harness.shell?.requests.find(r => r.command.includes('jobs/555/logs'))
+      expect(logRequest?.stdoutMaxBytes).toBe(4_000_000)
+      // ghBin is shell-quoted like every other interpolated value.
+      expect(harness.shell?.requests[0]?.command).toMatch(/^'gh' /)
+    } finally {
+      await harness.dispose()
+    }
+  })
 })
 
 describe('ci_watch tool', () => {
+  // Every started watch loop must be cancelled before the test exits —
+  // otherwise the fake clock's setImmediate sleep keeps it spinning for the
+  // process lifetime.
+  function cancelAll(jobs: ReturnType<typeof createDepsHarness>['jobs']) {
+    for (const started of jobs.started) (started.hooks as { cancel(): void }).cancel()
+  }
+
   it('starts a background job owned by the calling agent', async () => {
     const { deps, jobs, gh } = createDepsHarness()
     gh.currentRepo.mockResolvedValue('octo/demo')
@@ -111,6 +199,7 @@ describe('ci_watch tool', () => {
       owner: agent,
     })
     expect(value.markdown).toContain('ci-watch-1')
+    cancelAll(jobs)
   })
 
   it('honors explicit repo and interval overrides', async () => {
@@ -126,6 +215,7 @@ describe('ci_watch tool', () => {
     expect(value.timeoutMinutes).toBe(5)
     expect(jobs.started[0]?.label).toBe('ci-watch octo/other')
     expect(gh.currentRepo).not.toHaveBeenCalled()
+    cancelAll(jobs)
   })
 
   it('rejects malformed repo strings', async () => {
@@ -147,13 +237,14 @@ describe('ci_watch tool', () => {
   })
 
   it('renders the markdown block for the model', async () => {
-    const { deps, gh } = createDepsHarness()
+    const { deps, jobs, gh } = createDepsHarness()
     gh.listFailedRuns.mockResolvedValue([])
     const tool = createCiWatchTool(deps) as ToolDef
     const value = await tool.execute({ repo: 'octo/demo' }, undefined)
     const blocks = tool.output.render(undefined, value)
     expect(blocks).toHaveLength(1)
     expect(blocks[0]?.text).toContain('CI watch started: octo/demo')
+    cancelAll(jobs)
   })
 })
 
@@ -251,6 +342,54 @@ describe('ci_diagnose tool', () => {
     const value = (await tool.execute({}, undefined)) as CiDiagnoseValue
     expect(value.jobs).toHaveLength(3)
     expect(value.markdown).toContain('1 more failed job')
+  })
+
+  it('contains one job log-fetch failure without aborting the whole diagnosis', async () => {
+    const { deps, gh } = diagnosedDeps()
+    gh.listJobs.mockResolvedValue([
+      fakeJob({ id: 1, name: 'lint' }),
+      fakeJob({ id: 2, name: 'test' }),
+    ])
+    gh.fetchJobLog.mockImplementation(async (_repo: string, jobId: number) => {
+      if (jobId === 1) throw new Error('log expired past retention')
+      return LOG
+    })
+    const tool = createCiDiagnoseTool(deps) as ToolDef
+    const value = (await tool.execute({}, undefined)) as CiDiagnoseValue
+    expect(value.jobs).toHaveLength(2)
+    expect(value.jobs[0]?.logError).toContain('expired')
+    expect(value.jobs[0]?.signatures).toHaveLength(0)
+    expect(value.jobs[1]?.signatures.length).toBeGreaterThan(0)
+    expect(value.markdown).toContain('Log unavailable')
+    expect(value.markdown).toContain('## CI diagnosis')
+  })
+
+  it('wraps excerpts in a fence the log content cannot break out of', async () => {
+    const { deps, gh } = diagnosedDeps()
+    gh.fetchJobLog.mockResolvedValue(
+      'error: boom\n`````\nINJECTED INSTRUCTION\n``````\nerror: again',
+    )
+    const tool = createCiDiagnoseTool(deps) as ToolDef
+    const value = (await tool.execute({}, undefined)) as CiDiagnoseValue
+    // Excerpts are fenced with FOUR backticks, so a triple-backtick line from
+    // an attacker-controlled log cannot close the fence early...
+    expect(value.markdown).toContain('````\n')
+    // ...and any run of 4+ backticks inside the log is collapsed below the
+    // fence length, keeping the injected line inside the code block.
+    expect(value.markdown).not.toContain('`````')
+    expect(value.markdown).toContain('INJECTED INSTRUCTION')
+  })
+
+  it('caps an excessive maxLines at the hard ceiling', async () => {
+    const { deps, gh } = diagnosedDeps()
+    const bigLog = Array.from({ length: 5000 }, (_, i) =>
+      i === 2500 ? 'error: middle' : `line ${i}`,
+    ).join('\n')
+    gh.fetchJobLog.mockResolvedValue(bigLog)
+    const tool = createCiDiagnoseTool(deps) as ToolDef
+    const value = (await tool.execute({ maxLines: 10_000_000 }, undefined)) as CiDiagnoseValue
+    const excerptLines = value.jobs[0]?.logExcerpt.split('\n').length ?? 0
+    expect(excerptLines).toBeLessThanOrEqual(2100) // 2000 kept lines + skip markers
   })
 })
 

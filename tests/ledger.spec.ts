@@ -119,4 +119,34 @@ describe('openDomainLedger', () => {
     await ledger.close()
     expect(facility.closed).toBe(1)
   })
+
+  it('serializes concurrent record() upserts so no observation is lost', async () => {
+    // A put that resolves a macrotask later opens the read-modify-write
+    // window: without serialization, two concurrent records of the same
+    // signature both read count N and both write N+1.
+    const storage = new Map<string, unknown>()
+    const facility = {
+      async open() {
+        return {
+          table: (_name: string) => ({
+            get: (key: string) => storage.get(key),
+            put: async (key: string, value: unknown) => {
+              await new Promise(resolve => setTimeout(resolve, 5))
+              storage.set(key, value)
+            },
+            keys: () => storage.keys(),
+          }),
+          close: async () => undefined,
+        }
+      },
+    }
+    const ledger = await openDomainLedger(facility)
+    const [first, second] = await Promise.all([
+      ledger.record(INPUT, OBSERVATION),
+      ledger.record(INPUT, { ...OBSERVATION, now: new Date('2026-08-15T00:00:00Z') }),
+    ])
+    expect([first.count, second.count].sort((a, b) => a - b)).toEqual([1, 2])
+    expect((await ledger.lookup(INPUT.id))?.count).toBe(2)
+    await ledger.close()
+  })
 })

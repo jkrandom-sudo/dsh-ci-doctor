@@ -126,7 +126,7 @@ interface DomainLike {
   close(): Promise<void>
 }
 
-/** Domain name; must match the host's UNIT_NAME_RE (`/^[a-z][a-z0-_]*$/`). */
+/** Domain name; must match the host's UNIT_NAME_RE (`/^[a-z][a-z0-9_]*$/`). */
 export const LEDGER_DOMAIN_NAME = 'ci_doctor'
 /** Domain format version; bump on record shape changes. */
 export const LEDGER_DOMAIN_VERSION = 1
@@ -170,17 +170,25 @@ export async function openDomainLedger(facility: unknown): Promise<LedgerStore> 
     tables: { signatures: { valueSchema: recordSchema } },
   })
   const table = domain.table('signatures')
+  // record() is a read-modify-write across an await (put), and the diagnose
+  // tool advertises isConcurrencySafe — serialize upserts so two concurrent
+  // diagnoses of the same signature can't both read count N and write N+1.
+  let queue: Promise<unknown> = Promise.resolve()
   return {
     durable: true,
     lookup: async id => table.get(id) as SignatureRecord | undefined,
-    async record(input, observation) {
-      const merged = mergeRecord(
-        table.get(input.id) as SignatureRecord | undefined,
-        input,
-        observation,
-      )
-      await table.put(input.id, merged)
-      return merged
+    record(input, observation) {
+      const op = queue.then(async () => {
+        const merged = mergeRecord(
+          table.get(input.id) as SignatureRecord | undefined,
+          input,
+          observation,
+        )
+        await table.put(input.id, merged)
+        return merged
+      })
+      queue = op.catch(() => undefined)
+      return op
     },
     size: async () => {
       let count = 0

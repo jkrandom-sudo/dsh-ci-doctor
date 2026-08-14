@@ -133,4 +133,59 @@ describe('createWatch', () => {
     const outcome = await watch.done
     expect(outcome.status).toBe('completed')
   })
+
+  it('never reports historical failures when the baseline poll fails first', async () => {
+    // Regression: a transient baseline failure must not turn every
+    // pre-existing red run into a "NEW CI FAILURE" on the next good poll —
+    // detection stays suppressed until a baseline is actually established.
+    const { deps, gh } = makeDeps()
+    gh.listFailedRuns
+      .mockRejectedValueOnce(new GhError('rate-limit', 'API rate limit exceeded')) // baseline fails
+      .mockResolvedValueOnce([fakeRun({ id: 100 })]) // retry: establishes the baseline
+      .mockResolvedValue([fakeRun({ id: 101 }), fakeRun({ id: 100 })]) // then something new
+    const watch = createWatch(SPEC, deps)
+    const outcome = await watch.done
+    expect(outcome.status).toBe('completed')
+    expect(outcome.detail).toBe('failure detected')
+    const output = watch.readOutput()
+    expect(output).toContain('baseline set — ignoring 1 historical failed run(s)')
+    expect(output).toContain('run #101')
+    expect(output).not.toContain('run #100 (CI)') // never flagged as a detection
+  })
+
+  it('caps the sleep at the remaining lifetime instead of overshooting the deadline', async () => {
+    // intervalSeconds 3600 with a 1-minute timeout: the watch must expire
+    // after ~1 minute, not sleep an hour and then poll past its deadline.
+    const { deps, gh } = makeDeps()
+    const sleeps: number[] = []
+    const clock = createFakeClock()
+    deps.sleep = async ms => {
+      sleeps.push(ms)
+      clock.advance(ms) // time actually passes during the sleep
+    }
+    deps.now = clock.now
+    gh.listFailedRuns.mockResolvedValue([])
+    const watch = createWatch({ ...SPEC, intervalSeconds: 3600, timeoutMinutes: 1 }, deps)
+    const outcome = await watch.done
+    expect(outcome.status).toBe('completed')
+    expect(outcome.detail).toContain('expired')
+    expect(sleeps[0]).toBe(60_000) // capped to the remaining minute, not 3600s
+  })
+
+  it('honors a cancel delivered while a poll is in flight', async () => {
+    const { deps, gh } = makeDeps()
+    let cancel: (reason?: string) => void = () => undefined
+    gh.listFailedRuns
+      .mockResolvedValueOnce([fakeRun({ id: 100 })]) // baseline
+      .mockImplementation(async () => {
+        cancel('stop now') // kill lands mid-poll, before the result returns
+        return [fakeRun({ id: 101 }), fakeRun({ id: 100 })]
+      })
+    const watch = createWatch(SPEC, deps)
+    cancel = reason => watch.cancel(reason)
+    const outcome = await watch.done
+    // The in-flight detection must not settle the watch as completed.
+    expect(outcome.status).toBe('killed')
+    expect(outcome.detail).toBe('stop now')
+  })
 })

@@ -122,14 +122,32 @@ describe('extractSignatures', () => {
 
   it('skips noise lines (actions markers, stack frames, npm warnings)', () => {
     const log = [
-      '##[error]Process completed with exit code 1.', // kept — it is an error marker
+      '##[group]Run pnpm test', // dropped — group/notice marker
       'npm warn deprecated something',
       '    at Object.<anonymous> (x.ts:1:1)',
       '',
     ].join('\n')
-    const signatures = extractSignatures(log)
-    expect(signatures.map(s => s.evidence)).not.toContain('npm warn deprecated something')
-    expect(signatures.some(s => s.evidence.includes('at Object'))).toBe(false)
+    expect(extractSignatures(log)).toEqual([])
+  })
+
+  it('keeps the canonical ##[error] failure line, unwrapped', () => {
+    // GitHub Actions marks its headline failure line with ##[error]; the
+    // noise filter drops other ##[ markers but this one must survive.
+    const signatures = extractSignatures('##[error]Process completed with exit code 1.')
+    expect(signatures).toHaveLength(1)
+    expect(signatures[0]?.text).toBe('Process completed with exit code <n>.')
+  })
+
+  it('masks long hex digests (sha256) so signatures stay stable', () => {
+    const first = extractSignatures(
+      'error: checksum mismatch a94a8fe5ccb19ba61c4c0873d391e987982fbbd3e5c8b2e9f4a0c1d2e3f40506',
+    )
+    const second = extractSignatures(
+      'error: checksum mismatch 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef',
+    )
+    expect(first).toHaveLength(1)
+    expect(second).toHaveLength(1)
+    expect(first[0]?.id).toBe(second[0]?.id)
   })
 
   it('caps the number of signatures', () => {

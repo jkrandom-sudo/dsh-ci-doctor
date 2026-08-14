@@ -23,7 +23,7 @@
  * durability proof needs a diagnosis with real signatures).
  * Exit code 0 = every assertion passed.
  */
-import { existsSync, readFileSync, realpathSync } from 'node:fs'
+import { existsSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
@@ -60,6 +60,12 @@ const watchdog = setTimeout(() => {
 }, 180_000)
 
 console.log(`== dsh-ci-doctor real-environment verification (web profile, repo ${REPO}) ==`)
+
+// Snapshot the ledger file's mtime BEFORE boot: signature ids are
+// deterministic content hashes, so an ids-substring check alone would pass
+// against a stale file even if this run silently fell back to the memory
+// ledger. The durability proof must show THIS run rewrote the file.
+const ledgerMtimeBefore = existsSync(LEDGER_FILE) ? statSync(LEDGER_FILE).mtimeMs : 0
 
 healProfilesModuleFallback(INSTALL_ANCHOR)
 const profile = loadProfile('dsh', 'web', INSTALL_ANCHOR)
@@ -205,6 +211,14 @@ if (recordedSignatureIds.length > 0) {
     'signature ledger persisted to the storage unit file',
     recordedSignatureIds.every(id => fileText.includes(id)),
     `${LEDGER_FILE} missing or incomplete`,
+  )
+  // Anti-vacuity: the file must have been (re)written during THIS run — a
+  // stale file from an earlier run would otherwise satisfy the id check.
+  const mtimeAfter = existsSync(LEDGER_FILE) ? statSync(LEDGER_FILE).mtimeMs : 0
+  check(
+    'ledger file was rewritten during this run (not a stale leftover)',
+    mtimeAfter > ledgerMtimeBefore,
+    `ledger mtime unchanged (${mtimeAfter} <= ${ledgerMtimeBefore}) — ledger likely fell back to memory`,
   )
 }
 
