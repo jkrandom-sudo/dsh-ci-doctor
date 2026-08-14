@@ -1,0 +1,4 @@
+2026-08-14T09:00:01.0000000Z ##[group]Run pnpm install
+2026-08-14T09:00:02.0000000Z  ERR_PNPM_FETCH_404  GET https://registry.npmjs.org/left-pad: Not Found - 404
+2026-08-14T09:00:02.5000000Z npm ERR! code E404
+2026-08-14T09:00:03.0000000Z ##[error]Process completed with exit code 1.
