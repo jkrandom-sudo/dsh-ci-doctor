@@ -1,7 +1,7 @@
 {
   "name": "dsh-ci-doctor",
   "description": "CI doctor plugin for DeepSeek Harness: watch GitHub Actions failures, diagnose logs into structured findings, and drive the fix loop",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "private": false,
   "type": "module",
   "packageManager": "pnpm@11.7.0",
